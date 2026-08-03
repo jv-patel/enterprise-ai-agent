@@ -1,0 +1,72 @@
+services:
+  - type: web
+    name: enterprise-ai-agent-backend
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: GOOGLE_POST_AUTH_REDIRECT_URL
+        sync: false
+      - key: GOOGLE_POST_AUTH_ERROR_REDIRECT_URL
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: OAUTH_STATE_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: DEFAULT_GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: WEATHER_API_KEY
+        sync: false
+      - key: WEB_SEARCH_API_KEY
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-service-account.json
+      - key: GOOGLE_TTS_VOICE_NAME
+        value: en-US-Neural2-C
+      - key: GOOGLE_TTS_LANGUAGE_CODE
+        value: en-US
+      - key: GOOGLE_STT_LANGUAGE_CODE
+        value: en-US
+      - key: SUPABASE_STORAGE_BUCKET
+        value: user-uploads
+      - key: MAX_UPLOAD_BYTES
+        value: "20971520"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
