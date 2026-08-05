@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.core.dependencies import get_current_user_id
 from app.schemas.users import (
+    UserBootstrapRequest,
     UserProfileResponse,
     UserProfileUpdateRequest,
     UserSettingsResponse,
@@ -10,6 +11,14 @@ from app.schemas.users import (
 from app.services import user_service
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+@router.post("/bootstrap", response_model=UserProfileResponse)
+async def bootstrap_user(payload: UserBootstrapRequest) -> UserProfileResponse:
+    """Interim, no-auth identity creation: get-or-create a users row by
+    email. Used by the frontend on first visit until Firebase auth lands."""
+    user = await user_service.bootstrap_user(email=payload.email, display_name=payload.display_name)
+    return UserProfileResponse(**user)
 
 
 @router.get("/me", response_model=UserProfileResponse)
