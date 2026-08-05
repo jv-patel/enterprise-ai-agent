@@ -2,11 +2,12 @@
 User profile and settings.
 
 Reads/updates the `users` and `user_settings` rows for the current
-`X-User-Id`. The `users` row itself is created by the future Firebase-auth
-signup flow (not yet implemented — see project README roadmap); until then,
-these endpoints return a clear 404 rather than silently fabricating a
-profile, since `user_settings` has a foreign-key dependency on `users`.
+`X-User-Id`. Until Firebase auth lands, `bootstrap_user` is the interim way
+a `users` row gets created (called once by the frontend on first visit,
+before any user_id exists) — the future Firebase signup flow replaces this
+function's *caller*, not the `users` table shape it writes to.
 """
+import uuid
 from typing import Any
 
 from app.core.exceptions import NotFoundError
@@ -14,11 +15,44 @@ from app.database.supabase_client import get_supabase
 
 DEFAULT_SETTINGS = {
     "theme": "system",
-    "preferred_ai_model": "gemini-2.0-flash",
+    "preferred_ai_model": "gemini-2.5-flash",
     "preferred_provider": "gemini",
     "voice_enabled": True,
     "notification_prefs": {},
 }
+
+
+async def get_user_by_email(email: str) -> dict[str, Any] | None:
+    supabase = get_supabase()
+    response = supabase.table("users").select("*").eq("email", email).limit(1).execute()
+    return response.data[0] if response.data else None
+
+
+async def bootstrap_user(*, email: str, display_name: str | None) -> dict[str, Any]:
+    """Get-or-create a users row for an email with no prior identity system.
+
+    Interim mechanism: assigns a synthetic `firebase_uid` placeholder so the
+    column stays populated/unique. When Firebase auth lands, real sign-ups
+    will populate `firebase_uid` with the actual Firebase UID instead.
+    """
+    existing = await get_user_by_email(email)
+    if existing:
+        return existing
+
+    supabase = get_supabase()
+    response = (
+        supabase.table("users")
+        .insert(
+            {
+                "firebase_uid": f"local-{uuid.uuid4().hex}",
+                "email": email,
+                "display_name": display_name,
+                "auth_provider": "password",
+            }
+        )
+        .execute()
+    )
+    return response.data[0]
 
 
 async def get_profile(user_id: str) -> dict[str, Any]:
