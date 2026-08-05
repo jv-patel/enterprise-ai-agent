@@ -1,10 +1,15 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 Theme = Literal["light", "dark", "system"]
 Provider = Literal["gemini", "openrouter"]
+
+
+class UserBootstrapRequest(BaseModel):
+    email: EmailStr
+    display_name: str | None = Field(default=None, max_length=200)
 
 
 class UserProfileResponse(BaseModel):
