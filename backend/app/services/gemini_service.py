@@ -1,18 +1,21 @@
 """
 Google Gemini integration.
 
-Wraps the `google-generativeai` SDK for:
-  - multi-turn chat generation with native function calling (tool use)
-  - text embeddings (used by long-term memory search)
-
-All calls are synchronous at the SDK level, so they are run in a thread via
-`asyncio.to_thread` to avoid blocking the FastAPI event loop.
+Uses the `google-genai` SDK (Google's current, actively maintained client —
+the older `google-generativeai` package is being phased out). A stateful
+chat session is created per agent run and reused across every planning
+round: the SDK's own history handling automatically preserves "thought
+signatures" that Gemini 3.x models require for multi-turn function calling.
+Manually rebuilding conversation history (as the legacy SDK required) drops
+those signatures and causes 400 errors on the second tool-calling round —
+this design avoids that entirely.
 """
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from app.config import get_settings
 from app.core.exceptions import ExternalServiceError
@@ -20,26 +23,31 @@ from app.core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-_CONFIGURED = False
+_CLIENT: genai.Client | None = None
 
 
-def _ensure_configured() -> None:
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
+def _ensure_client() -> genai.Client:
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
     settings = get_settings()
     if not settings.GEMINI_API_KEY:
         raise ExternalServiceError(
             "Gemini is not configured. Set GEMINI_API_KEY.",
             error_code="gemini_not_configured",
         )
-    genai.configure(api_key=settings.GEMINI_API_KEY)
-    _CONFIGURED = True
+    _CLIENT = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _CLIENT
 
 
 def ensure_configured() -> None:
     """Public entry point for other services (e.g. vision_service) to reuse Gemini configuration."""
-    _ensure_configured()
+    _ensure_client()
+
+
+def get_client() -> genai.Client:
+    """Public accessor for the shared Gemini client (used by vision_service for one-shot multimodal calls)."""
+    return _ensure_client()
 
 
 @dataclass
@@ -54,41 +62,42 @@ class GeminiTurnResult:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
 
 
-def _history_to_contents(history: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """Convert stored chat_messages rows into Gemini `contents` history.
+def _history_to_contents(history: list[dict[str, str]]) -> list[types.Content]:
+    """Convert stored chat_messages rows into google-genai `Content` history.
 
     Gemini uses roles "user" and "model" only (no "assistant"/"system").
     """
-    contents: list[dict[str, Any]] = []
+    contents: list[types.Content] = []
     for message in history:
         if message["role"] == "system":
             continue
         role = "model" if message["role"] == "assistant" else "user"
-        contents.append({"role": role, "parts": [message["content"]]})
+        contents.append(types.Content(role=role, parts=[types.Part(text=message["content"])]))
     return contents
 
 
-def _build_function_declarations(tool_specs: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": spec.name,
-            "description": spec.description,
-            "parameters": spec.parameters,
-        }
+def _build_tools(tool_specs: list[Any]) -> list[types.Tool] | None:
+    if not tool_specs:
+        return None
+    declarations = [
+        types.FunctionDeclaration(name=spec.name, description=spec.description, parameters=spec.parameters)
         for spec in tool_specs
     ]
+    return [types.Tool(function_declarations=declarations)]
 
 
 def _extract_turn_result(response: Any) -> GeminiTurnResult:
     result = GeminiTurnResult()
-    if not response.candidates:
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
         return result
 
-    for part in response.candidates[0].content.parts:
+    parts = candidates[0].content.parts or []
+    for part in parts:
         function_call = getattr(part, "function_call", None)
         if function_call is not None and function_call.name:
             result.tool_calls.append(
-                ToolCallRequest(name=function_call.name, args=dict(function_call.args))
+                ToolCallRequest(name=function_call.name, args=dict(function_call.args or {}))
             )
         text = getattr(part, "text", None)
         if text:
@@ -97,29 +106,57 @@ def _extract_turn_result(response: Any) -> GeminiTurnResult:
     return result
 
 
-def _sync_send_message(
+class ChatSession:
+    """Wraps a google-genai chat session; offloads the SDK's synchronous
+    calls to a thread so the FastAPI event loop is never blocked."""
+
+    def __init__(self, chat: Any) -> None:
+        self._chat = chat
+
+    def _sync_send(self, message: Any) -> Any:
+        try:
+            return self._chat.send_message(message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Gemini generation failed")
+            raise ExternalServiceError(f"Gemini request failed: {exc}", error_code="gemini_error") from exc
+
+    async def send(self, message: Any) -> GeminiTurnResult:
+        response = await asyncio.to_thread(self._sync_send, message)
+        return _extract_turn_result(response)
+
+
+def create_chat_session(
+    *,
     system_instruction: str,
-    history: list[dict[str, Any]],
-    message_parts: Any,
+    history: list[dict[str, str]],
     tool_specs: list[Any],
-    model_name: str,
-) -> GeminiTurnResult:
-    _ensure_configured()
-    tools = [{"function_declarations": _build_function_declarations(tool_specs)}] if tool_specs else None
-
-    model = genai.GenerativeModel(
-        model_name=model_name,
+    model_name: str | None = None,
+) -> ChatSession:
+    client = _ensure_client()
+    settings = get_settings()
+    config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        tools=tools,
+        tools=_build_tools(tool_specs),
     )
-    chat = model.start_chat(history=history)
-    try:
-        response = chat.send_message(message_parts)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Gemini generation failed")
-        raise ExternalServiceError(f"Gemini request failed: {exc}", error_code="gemini_error") from exc
+    chat = client.chats.create(
+        model=model_name or settings.DEFAULT_GEMINI_MODEL,
+        config=config,
+        history=_history_to_contents(history),
+    )
+    return ChatSession(chat)
 
-    return _extract_turn_result(response)
+
+def build_tool_result_message(tool_results: list[dict[str, Any]]) -> list[types.Part]:
+    """Builds the function-response parts sent back to a live chat session
+    after tool execution. The SDK preserves thought signatures automatically
+    as long as the same ChatSession object keeps being used."""
+    return [
+        types.Part.from_function_response(
+            name=result["name"],
+            response={"result": result.get("output"), "error": result.get("error")},
+        )
+        for result in tool_results
+    ]
 
 
 async def generate_turn(
@@ -130,89 +167,26 @@ async def generate_turn(
     tool_specs: list[Any],
     model_name: str | None = None,
 ) -> GeminiTurnResult:
-    """First turn of a conversation step: send the user's message, optionally with tools."""
-    settings = get_settings()
-    contents_history = _history_to_contents(history)
-    return await asyncio.to_thread(
-        _sync_send_message,
-        system_instruction,
-        contents_history,
-        user_message,
-        tool_specs,
-        model_name or settings.DEFAULT_GEMINI_MODEL,
+    """One-shot generation (no ongoing multi-round tool use) — used for
+    routing, summarization, Q&A, and other single-turn tasks."""
+    session = create_chat_session(
+        system_instruction=system_instruction, history=history, tool_specs=tool_specs, model_name=model_name
     )
-
-
-def _function_call_parts(tool_calls: list[ToolCallRequest]) -> list[Any]:
-    return [
-        genai.protos.Part(function_call=genai.protos.FunctionCall(name=tc.name, args=tc.args))
-        for tc in tool_calls
-    ]
-
-
-def _function_response_parts(tool_results: list[dict[str, Any]]) -> list[Any]:
-    return [
-        genai.protos.Part(
-            function_response=genai.protos.FunctionResponse(
-                name=result["name"],
-                response={"result": result.get("output"), "error": result.get("error")},
-            )
-        )
-        for result in tool_results
-    ]
-
-
-async def generate_with_tool_results(
-    *,
-    system_instruction: str,
-    history: list[dict[str, str]],
-    prior_user_message: str,
-    completed_rounds: list[dict[str, Any]],
-    latest_tool_calls: list[ToolCallRequest],
-    latest_tool_results: list[dict[str, Any]],
-    tool_specs: list[Any],
-    model_name: str | None = None,
-) -> GeminiTurnResult:
-    """Continue a conversation turn after tool execution, feeding results back to the model.
-
-    `completed_rounds` holds every earlier (tool_calls, tool_results) pair from
-    this same planning loop, so multi-round tool chaining keeps full context.
-    Each item is `{"tool_calls": list[ToolCallRequest], "tool_results": list[dict]}`.
-    """
-    settings = get_settings()
-    contents_history = _history_to_contents(history)
-    contents_history.append({"role": "user", "parts": [prior_user_message]})
-
-    for round_ in completed_rounds:
-        contents_history.append({"role": "model", "parts": _function_call_parts(round_["tool_calls"])})
-        contents_history.append({"role": "user", "parts": _function_response_parts(round_["tool_results"])})
-
-    # The latest round's model turn goes into history; its results are sent as the new message.
-    contents_history.append({"role": "model", "parts": _function_call_parts(latest_tool_calls)})
-    message_parts = _function_response_parts(latest_tool_results)
-
-    return await asyncio.to_thread(
-        _sync_send_message,
-        system_instruction,
-        contents_history,
-        message_parts,
-        tool_specs,
-        model_name or settings.DEFAULT_GEMINI_MODEL,
-    )
+    return await session.send(user_message)
 
 
 def _sync_embed(text: str) -> list[float]:
-    _ensure_configured()
+    client = _ensure_client()
     try:
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text,
-            task_type="retrieval_document",
+        result = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=768),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Gemini embedding failed")
         raise ExternalServiceError(f"Gemini embedding failed: {exc}", error_code="gemini_embedding_error") from exc
-    return result["embedding"]
+    return list(result.embeddings[0].values)
 
 
 async def embed_text(text: str) -> list[float]:
