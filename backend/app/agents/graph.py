@@ -63,26 +63,22 @@ def _agent_name(state: AgentState) -> str:
 async def plan_node(state: AgentState) -> dict[str, Any]:
     system_instruction = _build_system_prompt(state)
     step_index = state.get("step_index", 0) + 1
-    tool_rounds = state.get("tool_rounds", [])
+    session = state.get("chat_session")
 
-    if tool_rounds:
-        last_round = tool_rounds[-1]
-        result = await gemini_service.generate_with_tool_results(
+    if session is None:
+        # First planning round: create the chat session and send the user's message.
+        session = gemini_service.create_chat_session(
             system_instruction=system_instruction,
             history=state["conversation_history"],
-            prior_user_message=state["user_message"],
-            completed_rounds=tool_rounds[:-1],
-            latest_tool_calls=last_round["tool_calls"],
-            latest_tool_results=last_round["tool_results"],
             tool_specs=state["tool_specs"],
         )
+        result = await session.send(state["user_message"])
     else:
-        result = await gemini_service.generate_turn(
-            system_instruction=system_instruction,
-            history=state["conversation_history"],
-            user_message=state["user_message"],
-            tool_specs=state["tool_specs"],
-        )
+        # Subsequent rounds: send the previous round's tool results back into
+        # the SAME session object, so the SDK preserves thought signatures
+        # automatically instead of us reconstructing history by hand.
+        message = gemini_service.build_tool_result_message(state.get("last_tool_results", []))
+        result = await session.send(message)
 
     await agent_log_service.log_step(
         run_id=state["run_id"],
@@ -96,6 +92,7 @@ async def plan_node(state: AgentState) -> dict[str, Any]:
     )
 
     update: dict[str, Any] = {
+        "chat_session": session,
         "step_index": step_index,
         "plan_iterations": state.get("plan_iterations", 0) + 1,
         "pending_tool_calls": result.tool_calls,
