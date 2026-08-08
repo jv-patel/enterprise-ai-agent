@@ -2,7 +2,7 @@
 from typing import Any, TypedDict
 
 from app.agents.tools.registry import ToolSpec
-from app.services.gemini_service import ToolCallRequest
+from app.services.gemini_service import ChatSession, ToolCallRequest
 
 
 class AgentState(TypedDict, total=False):
@@ -22,6 +22,7 @@ class AgentState(TypedDict, total=False):
     tool_specs: list[ToolSpec]
 
     # Working turn state
+    chat_session: ChatSession
     pending_tool_calls: list[ToolCallRequest]
     last_tool_results: list[dict[str, Any]]
     tool_rounds: list[dict[str, Any]]
