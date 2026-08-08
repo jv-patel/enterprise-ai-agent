@@ -1,16 +1,17 @@
 """
 Gemini Vision integration for image understanding, OCR, screenshot analysis,
 and chart/graph analysis. All four features share one underlying multimodal
-call (`_sync_generate`) with task-specific prompts.
+call (`_sync_generate`) with task-specific prompts. Uses the `google-genai`
+SDK client shared with gemini_service.py.
 """
 import asyncio
 
-import google.generativeai as genai
+from google.genai import types
 
 from app.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging_config import get_logger
-from app.services.gemini_service import ensure_configured
+from app.services.gemini_service import get_client
 
 logger = get_logger(__name__)
 
@@ -32,10 +33,12 @@ _CHART_PROMPT = (
 
 
 def _sync_generate(prompt: str, image_bytes: bytes, mime_type: str, model_name: str) -> str:
-    ensure_configured()
-    model = genai.GenerativeModel(model_name)
+    client = get_client()
     try:
-        response = model.generate_content([prompt, {"mime_type": mime_type, "data": image_bytes}])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Gemini vision request failed")
         raise ExternalServiceError(f"Gemini vision request failed: {exc}", error_code="gemini_vision_error") from exc
